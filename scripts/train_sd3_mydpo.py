@@ -39,6 +39,73 @@ config_flags.DEFINE_config_file("config", "config/base.py", "Training configurat
 
 logger = get_logger(__name__)
 
+class MyDistributedKRepeatSampler(Sampler):
+    def __init__(self, dataset, batch_size, k, num_replicas, rank, seed=0):
+        self.dataset = dataset
+        self.batch_size = batch_size  # Batch size per replica
+        self.num_replicas = num_replicas  # Total number of replicas
+        self.rank = rank              # Current replica rank
+        self.seed = seed              # Random seed for synchronization
+        
+        # Compute the number of unique samples needed per iteration
+        self.total_samples = self.num_replicas * self.batch_size
+        self.m = self.total_samples  # Number of unique samples
+        self.epoch = 0
+
+    def __iter__(self):
+        while True:
+            # Generate a deterministic random sequence to ensure all replicas are synchronized
+            g = torch.Generator()
+            g.manual_seed(self.seed + self.epoch)
+            
+            # Randomly select m unique samples
+            indices = torch.randperm(len(self.dataset), generator=g)[:self.m].tolist()
+            
+            # Split samples to each replica
+            per_card_samples = []
+            for i in range(self.num_replicas):
+                start = i * self.batch_size
+                end = start + self.batch_size
+                per_card_samples.append(indices[start:end])
+            
+            # Return current replica's sample indices
+            yield per_card_samples[self.rank]
+    
+    def set_epoch(self, epoch):
+        self.epoch = epoch  # Used to synchronize random state across epochs
+    
+
+class MyPromptDataset(Dataset):
+    def __init__(self, dataset, split='train'):
+        self.file_path = os.path.join(dataset, f'{split}_metadata.jsonl')
+        
+        self.split = split
+        with open(self.file_path, 'r', encoding='utf-8') as f:
+            self.metadatas = [json.loads(line) for line in f]
+            self.prompts = [item['prompt'] for item in self.metadatas]
+        
+    def __len__(self):
+        return len(self.prompts)
+    
+    def __getitem__(self, idx):
+        return {"prompt": self.prompts[idx], "metadata": {}}
+
+    @staticmethod
+    def collate_fn(examples):
+        if len(examples[0]["prompt"]) == 1:
+            prompts = [example["prompt"][0] for example in examples]
+            metadatas = [example["metadata"] for example in examples]
+            return prompts, metadatas
+        else:
+            prompts = []
+            for example in examples:
+                prompts.append(example["prompt"][0])
+                prompts.append(example["prompt"][1])
+            metadata_1 = [example["metadata"] for example in examples]
+            metadatas = metadata_1 + metadata_1
+            return prompts, metadatas
+
+
 class TextPromptDataset(Dataset):
     def __init__(self, dataset, split='train'):
         self.file_path = os.path.join(dataset, f'{split}.txt')
@@ -332,7 +399,7 @@ def main(_):
         gradient_accumulation_steps=config.train.gradient_accumulation_steps * num_train_timesteps,
     )
     if accelerator.is_main_process:
-        swanlab.init(project="sd3_dpo", name="baseline")
+        swanlab.init(project="sd3_dpo", name="mydpo")
         # accelerator.init_trackers(
         #     project_name="flow-grpo",
         #     config=config.to_dict(),
@@ -449,10 +516,41 @@ def main(_):
     )
 
     # prepare prompt and reward fn
-    reward_fn = getattr(flow_grpo.rewards, 'multi_score')(accelerator.device, config.reward_fn)
+    # reward_fn = getattr(flow_grpo.rewards, 'multi_score')(accelerator.device, config.reward_fn)
     eval_reward_fn = getattr(flow_grpo.rewards, 'multi_score')(accelerator.device, config.reward_fn)
 
-    if config.prompt_fn == "general_ocr":
+    if config.prompt_fn == "mydata":
+        train_dataset = MyPromptDataset(config.dataset, 'train')
+        test_dataset = MyPromptDataset(config.dataset, 'test')
+
+        # Create an infinite-loop DataLoader
+        train_sampler = MyDistributedKRepeatSampler( 
+            dataset=train_dataset,
+            batch_size=config.sample.train_batch_size,
+            k=config.sample.num_image_per_prompt,
+            num_replicas=accelerator.num_processes,
+            rank=accelerator.process_index,
+            seed=42
+        )
+
+        # Create a DataLoader; note that shuffling is not needed here because it’s controlled by the Sampler.
+        train_dataloader = DataLoader(
+            train_dataset,
+            batch_sampler=train_sampler,
+            num_workers=1,
+            collate_fn=MyPromptDataset.collate_fn,
+            # persistent_workers=True
+        )
+
+        # Create a regular DataLoader
+        test_dataloader = DataLoader(
+            test_dataset,
+            batch_size=config.sample.test_batch_size,
+            collate_fn=MyPromptDataset.collate_fn,
+            shuffle=False,
+            num_workers=8,
+        )
+    elif config.prompt_fn == "general_ocr":
         train_dataset = TextPromptDataset(config.dataset, 'train')
         test_dataset = TextPromptDataset(config.dataset, 'test')
 
@@ -517,8 +615,8 @@ def main(_):
 
     neg_prompt_embed, neg_pooled_prompt_embed = compute_text_embeddings([""], text_encoders, tokenizers, max_sequence_length=128, device=accelerator.device)
 
-    sample_neg_prompt_embeds = neg_prompt_embed.repeat(config.sample.train_batch_size, 1, 1)
-    sample_neg_pooled_prompt_embeds = neg_pooled_prompt_embed.repeat(config.sample.train_batch_size, 1)
+    sample_neg_prompt_embeds = neg_prompt_embed.repeat(config.sample.train_batch_size*2, 1, 1)
+    sample_neg_pooled_prompt_embeds = neg_pooled_prompt_embed.repeat(config.sample.train_batch_size*2, 1)
 
     if config.sample.num_image_per_prompt == 1:
         config.per_prompt_stat_tracking = False
@@ -632,9 +730,9 @@ def main(_):
                     )
 
             # compute rewards asynchronously
-            rewards = executor.submit(reward_fn, images, prompts, prompt_metadata, only_strict=True)
+            # rewards = executor.submit(reward_fn, images, prompts, prompt_metadata, only_strict=True)
             # yield to to make sure reward computation starts
-            time.sleep(0)
+            # time.sleep(0)
 
             samples.append(
                 {
@@ -642,23 +740,23 @@ def main(_):
                     "prompt_embeds": prompt_embeds,
                     "pooled_prompt_embeds": pooled_prompt_embeds,
                     "latents": latents[-1],
-                    "rewards": rewards,
+                    # "rewards": rewards,
                 }
             )
 
         # wait for all rewards to be computed
-        for sample in tqdm(
-            samples,
-            desc="Waiting for rewards",
-            disable=not accelerator.is_local_main_process,
-            position=0,
-        ):
-            rewards, reward_metadata = sample["rewards"].result()
-            # accelerator.print(reward_metadata)
-            sample["rewards"] = {
-                key: torch.as_tensor(value, device=accelerator.device).float()
-                for key, value in rewards.items()
-            }
+        # for sample in tqdm(
+        #     samples,
+        #     desc="Waiting for rewards",
+        #     disable=not accelerator.is_local_main_process,
+        #     position=0,
+        # ):
+        #     rewards, reward_metadata = sample["rewards"].result()
+        #     # accelerator.print(reward_metadata)
+        #     sample["rewards"] = {
+        #         key: torch.as_tensor(value, device=accelerator.device).float()
+        #         for key, value in rewards.items()
+        #     }
 
         # collate samples into dict where each entry has shape (num_batches_per_epoch * sample.batch_size, ...)
         samples = {
@@ -686,65 +784,66 @@ def main(_):
                     pil.save(os.path.join(tmpdir, f"{idx}.jpg"))  # 使用新的索引
 
                 sampled_prompts = [prompts[i] for i in sample_indices]
-                sampled_rewards = [rewards['avg'][i] for i in sample_indices]
+                # sampled_rewards = [rewards['avg'][i] for i in sample_indices]
 
                 swanlab.log(
                     {
                         "images": [
                             swanlab.Image(
                                 os.path.join(tmpdir, f"{idx}.jpg"),
-                                caption=f"{prompt:.100} | avg: {avg_reward:.2f}",
+                                caption=f"{prompt:.100}",
                             )
-                            for idx, (prompt, avg_reward) in enumerate(zip(sampled_prompts, sampled_rewards))
+                            # for idx, (prompt, avg_reward) in enumerate(zip(sampled_prompts, sampled_rewards))
+                            for idx, prompt in enumerate(sampled_prompts)
                         ],
                     },
                     step=global_step,
                 )
-        samples["rewards"]["ori_avg"] = samples["rewards"]["avg"]
-        samples["rewards"]["avg"] = samples["rewards"]["avg"].unsqueeze(-1)
+        # samples["rewards"]["ori_avg"] = samples["rewards"]["avg"]
+        # samples["rewards"]["avg"] = samples["rewards"]["avg"].unsqueeze(-1)
         
         # gather rewards across processes
-        gathered_rewards = {key: accelerator.gather(value) for key, value in samples["rewards"].items()}
-        gathered_rewards = {key: value.cpu().numpy() for key, value in gathered_rewards.items()}
+        # gathered_rewards = {key: accelerator.gather(value) for key, value in samples["rewards"].items()}
+        # gathered_rewards = {key: value.cpu().numpy() for key, value in gathered_rewards.items()}
         # log rewards and images
-        if accelerator.is_main_process:
-            swanlab.log(
-                {
-                    "epoch": epoch,
-                    **{f"reward_{key}": value.mean() for key, value in gathered_rewards.items() if '_strict_accuracy' not in key and '_accuracy' not in key},
-                },
-                step=global_step,
-            )
+        # if accelerator.is_main_process:
+        #     swanlab.log(
+        #         {
+        #             "epoch": epoch,
+        #             **{f"reward_{key}": value.mean() for key, value in gathered_rewards.items() if '_strict_accuracy' not in key and '_accuracy' not in key},
+        #         },
+        #         step=global_step,
+        #     )
 
         # per-prompt mean/std tracking
-        if config.per_prompt_stat_tracking:
-            # gather the prompts across processes
-            prompt_ids = accelerator.gather(samples["prompt_ids"]).cpu().numpy()
-            prompts = pipeline.tokenizer.batch_decode(
-                prompt_ids, skip_special_tokens=True
-            )
-            advantages = stat_tracker.update(prompts, gathered_rewards['avg'], type=config.train.algorithm)
-            if accelerator.is_local_main_process:
-                print("len(prompts)", len(prompts))
-                print("len unique prompts", len(set(prompts)))
+        # if config.per_prompt_stat_tracking:
+        #     # gather the prompts across processes
+        #     prompt_ids = accelerator.gather(samples["prompt_ids"]).cpu().numpy()
+        #     prompts = pipeline.tokenizer.batch_decode(
+        #         prompt_ids, skip_special_tokens=True
+        #     )
+        #     advantages = stat_tracker.update(prompts, gathered_rewards['avg'], type=config.train.algorithm)
+        #     if accelerator.is_local_main_process:
+        #         print("len(prompts)", len(prompts))
+        #         print("len unique prompts", len(set(prompts)))
 
-            group_size, trained_prompt_num = stat_tracker.get_stats()
+        #     group_size, trained_prompt_num = stat_tracker.get_stats()
 
-            zero_std_ratio, reward_std_mean = calculate_zero_std_ratio(prompts, gathered_rewards)
+        #     zero_std_ratio, reward_std_mean = calculate_zero_std_ratio(prompts, gathered_rewards)
 
-            if accelerator.is_main_process:
-                swanlab.log(
-                    {
-                        "group_size": group_size,
-                        "trained_prompt_num": trained_prompt_num,
-                        "zero_std_ratio": zero_std_ratio,
-                        "reward_std_mean": reward_std_mean,
-                    },
-                    step=global_step,
-                )
-            stat_tracker.clear()
-        else:
-            advantages = (gathered_rewards['avg'] - gathered_rewards['avg'].mean()) / (gathered_rewards['avg'].std() + 1e-4)
+        #     if accelerator.is_main_process:
+        #         swanlab.log(
+        #             {
+        #                 "group_size": group_size,
+        #                 "trained_prompt_num": trained_prompt_num,
+        #                 "zero_std_ratio": zero_std_ratio,
+        #                 "reward_std_mean": reward_std_mean,
+        #             },
+        #             step=global_step,
+        #         )
+        #     stat_tracker.clear()
+        # else:
+        #     advantages = (gathered_rewards['avg'] - gathered_rewards['avg'].mean()) / (gathered_rewards['avg'].std() + 1e-4)
 
         # ungather advantages; we only need to keep the entries corresponding to the samples on this process
 
@@ -754,39 +853,48 @@ def main(_):
         pooled_prompt_embeds = accelerator.gather(samples['pooled_prompt_embeds']).cpu().numpy()
 
         # Filter out samples with non-zero advantages
-        non_zero_indices = np.where(advantages != 0)[0]
-        filtered_advantages = advantages[non_zero_indices]
-        filtered_latents = latents[non_zero_indices]
-        filtered_prompt_ids = prompt_ids[non_zero_indices]
-        filtered_prompt_embeds = prompt_embeds[non_zero_indices]
-        filtered_pooled_prompt_embeds = pooled_prompt_embeds[non_zero_indices]
+        # non_zero_indices = np.where(advantages != 0)[0]
+        # filtered_advantages = advantages[non_zero_indices]
+        # filtered_latents = latents[non_zero_indices]
+        # filtered_prompt_ids = prompt_ids[non_zero_indices]
+        # filtered_prompt_embeds = prompt_embeds[non_zero_indices]
+        # filtered_pooled_prompt_embeds = pooled_prompt_embeds[non_zero_indices]
+
+        # filtered_advantages = advantages
+        filtered_latents = latents
+        # filtered_prompt_ids = prompt_ids
+        filtered_prompt_embeds = prompt_embeds
+        filtered_pooled_prompt_embeds = pooled_prompt_embeds
         
         # Group latents by prompt_ids
-        unique_prompt_ids = np.unique(filtered_prompt_ids, axis=0)
-        concat_advantages = []
+        # unique_prompt_ids = np.unique(filtered_prompt_ids, axis=0)
+        # concat_advantages = []
         concat_latent = []
         concat_prompt_embeds = []
         concat_pooled_prompt_embeds = []
 
-        for prompt_id in unique_prompt_ids:
+        # for prompt_id in unique_prompt_ids:
+        for i in range(filtered_latents.shape[0]//2):
             # Find indices where prompt_id matches
-            matches = np.where(np.all(filtered_prompt_ids == prompt_id, axis=1))[0]
-            advantages = filtered_advantages[matches]
-            latents = filtered_latents[matches]
-            prompt_embeds = filtered_prompt_embeds[matches]
-            pooled_prompt_embeds = filtered_pooled_prompt_embeds[matches]
-            concat_advantages.append(advantages)
+            # matches = np.where(np.all(filtered_prompt_ids == prompt_id, axis=1))[0]
+            matches_latents = np.array([2*i, 2*i+1])
+            matches_other = np.array([2*i, 2*i])
+            # advantages = filtered_advantages[matches]
+            latents = filtered_latents[matches_latents]
+            prompt_embeds = filtered_prompt_embeds[matches_other]
+            pooled_prompt_embeds = filtered_pooled_prompt_embeds[matches_other]
+            # concat_advantages.append(advantages)
             concat_latent.append(latents)
             concat_prompt_embeds.append(prompt_embeds)
             concat_pooled_prompt_embeds.append(pooled_prompt_embeds)
         
         # Stack all grouped latents
-        concat_advantages = np.stack(concat_advantages, axis=0)  # Shape: [num_prompts, 2, 1]
+        # concat_advantages = np.stack(concat_advantages, axis=0)  # Shape: [num_prompts, 2, 1]
         concat_latent = np.stack(concat_latent, axis=0)  # Shape: [num_prompts, 2, 16, 64, 64]
         concat_prompt_embeds = np.stack(concat_prompt_embeds, axis=0)
         concat_pooled_prompt_embeds = np.stack(concat_pooled_prompt_embeds, axis=0)
 
-        concat_advantages = torch.as_tensor(concat_advantages)
+        # concat_advantages = torch.as_tensor(concat_advantages)
         concat_latent = torch.as_tensor(concat_latent)
         concat_prompt_embeds = torch.as_tensor(concat_prompt_embeds)
         concat_pooled_prompt_embeds = torch.as_tensor(concat_pooled_prompt_embeds)
@@ -794,7 +902,8 @@ def main(_):
         # This is because when handling multiple tasks, our prompt dataset contains duplicates, which leads to inconsistent group sizes.
         # Check if we have enough samples to distribute across processes
         min_required_samples = accelerator.num_processes
-        current_samples = concat_advantages.shape[0]
+        # current_samples = concat_advantages.shape[0]
+        current_samples = concat_latent.shape[0]
         
         # If we don't have enough samples, randomly sample from existing ones to make it divisible
         if current_samples % min_required_samples != 0:
@@ -803,23 +912,23 @@ def main(_):
             random_indices = torch.randint(0, current_samples, (samples_needed,))
             
             # Append the randomly sampled data to make it divisible by num_processes
-            concat_advantages = torch.cat([concat_advantages, concat_advantages[random_indices]], dim=0)
+            # concat_advantages = torch.cat([concat_advantages, concat_advantages[random_indices]], dim=0)
             concat_latent = torch.cat([concat_latent, concat_latent[random_indices]], dim=0)
             concat_prompt_embeds = torch.cat([concat_prompt_embeds, concat_prompt_embeds[random_indices]], dim=0)
             concat_pooled_prompt_embeds = torch.cat([concat_pooled_prompt_embeds, concat_pooled_prompt_embeds[random_indices]], dim=0)
 
-        advantages = concat_advantages.reshape(accelerator.num_processes, -1, *concat_advantages.shape[1:])[accelerator.process_index].to(accelerator.device)
+        # advantages = concat_advantages.reshape(accelerator.num_processes, -1, *concat_advantages.shape[1:])[accelerator.process_index].to(accelerator.device)
         latents = concat_latent.reshape(accelerator.num_processes, -1, *concat_latent.shape[1:])[accelerator.process_index].to(accelerator.device)
         prompt_embeds = concat_prompt_embeds.reshape(accelerator.num_processes, -1, *concat_prompt_embeds.shape[1:])[accelerator.process_index].to(accelerator.device)
         pooled_prompt_embeds = concat_pooled_prompt_embeds.reshape(accelerator.num_processes, -1, *concat_pooled_prompt_embeds.shape[1:])[accelerator.process_index].to(accelerator.device)
         
-        advantages = advantages.squeeze(-1)
-        num_prompts = advantages.shape[0]
-        for i in range(num_prompts):
-            if advantages[i, 0] == -1:
-                temp = latents[i, 0].clone()
-                latents[i, 0] = latents[i, 1].clone()
-                latents[i, 1] = temp
+        # advantages = advantages.squeeze(-1)
+        # num_prompts = advantages.shape[0]
+        # for i in range(num_prompts):
+        #     if advantages[i, 0] == -1:
+        #         temp = latents[i, 0].clone()
+        #         latents[i, 0] = latents[i, 1].clone()
+        #         latents[i, 1] = temp
         
         latents = latents.permute(1,0,2,3,4)
         prompt_embeds = prompt_embeds.permute(1,0,2,3)
@@ -828,7 +937,7 @@ def main(_):
         samples["prompt_embeds"] = prompt_embeds.reshape(-1,*prompt_embeds.shape[2:])
         samples["pooled_prompt_embeds"] = pooled_prompt_embeds.reshape(-1,*pooled_prompt_embeds.shape[2:])
         
-        del samples["rewards"]
+        # del samples["rewards"]
         del samples["prompt_ids"]
 
         total_batch_size = len(samples["latents"])

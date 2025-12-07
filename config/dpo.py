@@ -106,7 +106,7 @@ def pickscore_sd3():
 
 def pickscore_sd3_mydpo():
     config = compressibility()
-    config.dataset = os.path.join(os.getcwd(), "dataset/pickscore")
+    config.dataset = os.path.join(os.getcwd(), "dataset/mydata")
 
     # sd3.5 medium
     config.pretrained.model = "/root/models/stabilityai/stable-diffusion-3.5-medium"
@@ -115,8 +115,8 @@ def pickscore_sd3_mydpo():
     config.sample.guidance_scale=4.5
 
     config.resolution = 512
-    config.sample.train_batch_size = 24
-    config.sample.num_image_per_prompt = 24
+    config.sample.train_batch_size = 8
+    # config.sample.num_image_per_prompt = 24
     config.sample.num_batches_per_epoch = 1
     config.sample.test_batch_size = 16 # # This bs is a special design, the test set has a total of 2048, to make gpu_num*bs*n as close as possible to 2048, because when the number of samples cannot be divided evenly by the number of cards, multi-card will fill the last batch to ensure each card has the same number of samples, affecting gradient synchronization.
     
@@ -138,7 +138,7 @@ def pickscore_sd3_mydpo():
         "pickscore": 1.0,
     }
     
-    config.prompt_fn = "general_ocr"
+    config.prompt_fn = "mydata"
 
     config.per_prompt_stat_tracking = True
     return config
