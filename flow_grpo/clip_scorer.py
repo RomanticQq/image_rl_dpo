@@ -31,8 +31,8 @@ class ClipScorer(torch.nn.Module):
     def __init__(self, device):
         super().__init__()
         self.device=device
-        self.model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14").to(device)
-        self.processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
+        self.model = CLIPModel.from_pretrained("/root/models/openai/clip-vit-large-patch14").to(device)
+        self.processor = CLIPProcessor.from_pretrained("/root/models/openai/clip-vit-large-patch14")
         self.tform = get_image_transform(self.processor.image_processor)
         self.eval()
     

@@ -137,6 +137,8 @@ def pickscore_sd3_mydpo():
     config.reward_fn = {
         "pickscore": 1.0,
         "imagereward": 1.0,
+        "aesthetic": 1.0,
+        "clipscore": 1.0,
     }
     
     config.prompt_fn = "mydata"
