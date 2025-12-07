@@ -70,7 +70,7 @@ def pickscore_sd3():
     config.dataset = os.path.join(os.getcwd(), "dataset/pickscore")
 
     # sd3.5 medium
-    config.pretrained.model = "stabilityai/stable-diffusion-3.5-medium"
+    config.pretrained.model = "/root/models/stabilityai/stable-diffusion-3.5-medium"
     config.sample.num_steps = 40
     config.sample.eval_num_steps = 40
     config.sample.guidance_scale=4.5
@@ -92,8 +92,8 @@ def pickscore_sd3():
     config.train.beta = 100   
     config.sample.global_std=True
     config.train.ema=True
-    config.save_freq = 60 # epoch
-    config.eval_freq = 60
+    config.save_freq = 480 # epoch
+    config.eval_freq = 480
     config.save_dir = 'logs/pickscore/sd3.5-M-dpo'
     config.reward_fn = {
         "pickscore": 1.0,
