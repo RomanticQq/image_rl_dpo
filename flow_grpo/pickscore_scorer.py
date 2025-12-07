@@ -46,7 +46,7 @@ class PickScoreScorer(torch.nn.Module):
         scores = logit_scale * (text_embs @ image_embs.T)
         scores = scores.diag()
         # norm to 0-1
-        scores = scores/26
+        # scores = scores/26
         return scores
 
 # Usage example
