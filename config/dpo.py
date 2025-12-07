@@ -136,6 +136,7 @@ def pickscore_sd3_mydpo():
     config.save_dir = 'logs/pickscore/sd3.5-M-mydpo'
     config.reward_fn = {
         "pickscore": 1.0,
+        "imagereward": 1.0,
     }
     
     config.prompt_fn = "mydata"
