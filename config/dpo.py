@@ -92,8 +92,8 @@ def pickscore_sd3():
     config.train.beta = 100   
     config.sample.global_std=True
     config.train.ema=True
-    config.save_freq = 480 # epoch
-    config.eval_freq = 480
+    config.save_freq = 300 # epoch
+    config.eval_freq = 300
     config.save_dir = 'logs/pickscore/sd3.5-M-dpo'
     config.reward_fn = {
         "pickscore": 1.0,
